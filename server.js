@@ -12,9 +12,6 @@ const PORT = process.env.PORT || 3000;
 const SECRET = process.env.VSAVEIT_SECRET || "vsaveit-secret-change-this";
 const COOKIES_PATH = path.join(__dirname, "cookies.txt");
 
-// ── Write cookies file on startup if provided ──
-// Paste the raw cookies.txt (Netscape format) content directly into the
-// Railway env var YTDLP_COOKIES — no base64 encoding needed, multi-line is fine.
 let hasCookies = false;
 if (process.env.YTDLP_COOKIES && process.env.YTDLP_COOKIES.trim().length > 0) {
   try {
@@ -25,7 +22,7 @@ if (process.env.YTDLP_COOKIES && process.env.YTDLP_COOKIES.trim().length > 0) {
     console.error("[ytserver] Failed to write cookies file:", e.message);
   }
 } else {
-  console.warn("[ytserver] ⚠️  No YTDLP_COOKIES env var set — bot-detection may block requests");
+  console.warn("[ytserver] ⚠️  No YTDLP_COOKIES env var set");
 }
 
 app.use(cors());
@@ -35,14 +32,10 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", service: "VSaveIt YouTube Server", cookiesLoaded: hasCookies });
 });
 
-/**
- * Runs yt-dlp with given extra args, returns parsed JSON info.
- * Throws with err.stderr containing the actual yt-dlp error text.
- */
 async function runYtDlp(url, extraArgs) {
   const safeUrl = url.replace(/"/g, "").replace(/`/g, "").replace(/\$/g, "");
   const cmd = `yt-dlp --dump-json --no-playlist --no-warnings ${extraArgs} "${safeUrl}"`;
-  const { stdout } = await execAsync(cmd, { timeout: 28000, maxBuffer: 1024 * 1024 * 20 });
+  const { stdout } = await execAsync(cmd, { timeout: 27000, maxBuffer: 1024 * 1024 * 20 });
   return JSON.parse(stdout);
 }
 
@@ -50,6 +43,7 @@ app.post("/info", async (req, res) => {
   const { url, secret } = req.body;
 
   if (secret !== SECRET) {
+    console.warn("[ytserver] Rejected request — secret mismatch");
     return res.status(401).json({ error: "Unauthorized" });
   }
   if (!url || typeof url !== "string") {
@@ -59,43 +53,46 @@ app.post("/info", async (req, res) => {
     return res.status(400).json({ error: "Only YouTube URLs supported" });
   }
 
-  console.log("[ytserver] Fetching:", url.slice(0, 60));
+  console.log("[ytserver] Fetching:", url.slice(0, 60), "| cookiesLoaded:", hasCookies);
 
   let info;
   let lastErr;
 
-  // ── Attempt 1: android client (often bypasses bot-check without cookies) ──
+  // ── Attempt 1: android + ios clients combined (best no-cookie combo) ──
   try {
-    info = await runYtDlp(url, `--extractor-args "youtube:player_client=android"`);
-    console.log("[ytserver] ✅ succeeded via android client (no cookies needed)");
+    info = await runYtDlp(url, `--extractor-args "youtube:player_client=android,ios"`);
+    console.log("[ytserver] ✅ succeeded via android+ios client (no cookies needed)");
   } catch (err) {
     lastErr = err;
     const stderr = (err.stderr || err.message || "").toString();
-    console.warn("[ytserver] android client failed:", stderr.slice(0, 150));
+    console.warn("[ytserver] android+ios failed:", stderr.slice(0, 200));
 
-    // ── Attempt 2: cookies + web client (if cookies available) ──
+    // ── Attempt 2: cookies + web client ──
     if (hasCookies) {
       try {
         info = await runYtDlp(
           url,
-          `--cookies "${COOKIES_PATH}" --extractor-args "youtube:player_client=web,android"`
+          `--cookies "${COOKIES_PATH}" --extractor-args "youtube:player_client=web"`
         );
-        console.log("[ytserver] ✅ succeeded via cookies");
+        console.log("[ytserver] ✅ succeeded via cookies + web client");
       } catch (err2) {
         lastErr = err2;
-        console.error("[ytserver] cookies attempt also failed:", (err2.stderr || err2.message || "").toString().slice(0, 200));
+        console.error("[ytserver] cookies attempt also failed:", (err2.stderr || err2.message || "").toString().slice(0, 300));
       }
+    } else {
+      console.warn("[ytserver] No cookies available to retry with");
     }
   }
 
   if (!info) {
     const stderrText = (lastErr?.stderr || lastErr?.message || "").toString();
+    console.error("[ytserver] FINAL FAILURE. Full stderr:", stderrText.slice(0, 500));
 
     if (stderrText.includes("Sign in to confirm")) {
       return res.status(403).json({
         error: hasCookies
-          ? "YouTube is blocking this request even with cookies. The cookies may have expired — please refresh them."
-          : "YouTube is blocking requests from this server. Cookie authentication needs to be set up (YTDLP_COOKIES).",
+          ? "YouTube is blocking this request even with cookies. The cookies may have expired — export fresh ones."
+          : "YouTube is blocking requests from this server (no cookies configured). Set YTDLP_COOKIES in Railway.",
       });
     }
     if (stderrText.includes("Video unavailable") || stderrText.includes("Private video")) {
@@ -104,12 +101,11 @@ app.post("/info", async (req, res) => {
     if (stderrText.includes("age")) {
       return res.status(403).json({ error: "This video is age-restricted." });
     }
-    if (lastErr?.killed || stderrText.includes("timeout")) {
+    if (lastErr?.killed || stderrText.includes("timeout") || stderrText.includes("ETIMEDOUT")) {
       return res.status(504).json({ error: "Request timed out. Please try again." });
     }
 
-    console.error("[ytserver] Unhandled failure:", stderrText.slice(0, 300));
-    return res.status(500).json({ error: "Could not fetch video info. Please try again." });
+    return res.status(500).json({ error: `yt-dlp failed: ${stderrText.slice(0, 200) || "unknown error"}` });
   }
 
   try {
@@ -146,8 +142,11 @@ app.post("/info", async (req, res) => {
     }));
 
     if (medias.length === 0) {
-      return res.status(404).json({ error: "No downloadable formats found." });
+      console.warn("[ytserver] yt-dlp succeeded but 0 progressive formats found. Raw format count:", formats.length);
+      return res.status(404).json({ error: "No downloadable formats found for this video." });
     }
+
+    console.log("[ytserver] Returning", medias.length, "formats:", medias.map(m => m.quality).join(", "));
 
     return res.json({
       title: info.title ?? "YouTube Video",
