@@ -48,14 +48,12 @@ async function runYtDlpInfo(url, extra) {
 
 async function fetchInfo(url) {
   let info = null, lastErr = null;
-  // Try 1: android client (no cookies needed)
   try {
     info = await runYtDlpInfo(url, `--extractor-args "youtube:player_client=android"`);
     console.log("[ytserver] ✅ android client");
   } catch (e) {
     lastErr = e;
     console.warn("[ytserver] android failed:", (e.stderr || e.message || "").toString().slice(0, 120));
-    // Try 2: cookies + web
     if (hasCookies) {
       try {
         info = await runYtDlpInfo(url, `${cookieArgs()} --extractor-args "youtube:player_client=web,android"`);
@@ -70,7 +68,7 @@ async function fetchInfo(url) {
 }
 
 // ══════════════════════════════════════════════
-// POST /info  — returns format list
+// POST /info
 // ══════════════════════════════════════════════
 app.post("/info", async (req, res) => {
   const { url, secret } = req.body;
@@ -106,12 +104,12 @@ app.post("/info", async (req, res) => {
 
     console.log("[ytserver] bestAudio:", bestAudio ? `${bestAudio.format_id} (${bestAudio.abr}kbps)` : "NONE");
 
-    // Progressive formats (video+audio together) — usually ≤480p
+    // Progressive (video+audio together) ≤480p
     const progressive = formats.filter(
       (f) => f.vcodec && f.vcodec !== "none" && f.acodec && f.acodec !== "none" && f.url && f.ext !== "3gp"
     );
 
-    // Video-only HD — YouTube sends 720p+ as video-only (acodec=none)
+    // Video-only HD (720p+) — need merge with audio
     const videoOnly = formats.filter(
       (f) => f.vcodec && f.vcodec !== "none" &&
              (!f.acodec || f.acodec === "none") &&
@@ -121,7 +119,6 @@ app.post("/info", async (req, res) => {
 
     console.log(`[ytserver] progressive: ${progressive.length}, videoOnly: ${videoOnly.length}`);
 
-    // Merge, sort, deduplicate by height
     const all = [...videoOnly, ...progressive].sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
     const seen = new Set();
     const deduped = all.filter((f) => {
@@ -131,21 +128,25 @@ app.post("/info", async (req, res) => {
       return true;
     });
 
+    // SELF_URL: used to build /download merge endpoint URLs
+    // Railway automatically sets RAILWAY_PUBLIC_DOMAIN
     const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
       ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-      : process.env.SELF_URL || "";
+      : (process.env.SELF_URL || "").replace(/\/$/, "");
+
+    console.log("[ytserver] SELF_URL:", SELF_URL || "(NOT SET — HD audio will be missing!)");
 
     const medias = deduped.map((f) => {
       const isVideoOnly = !f.acodec || f.acodec === "none";
-      const needsMerge  = isVideoOnly && !!bestAudio;
+      const needsMerge = isVideoOnly && !!bestAudio && !!SELF_URL;
       const sizeStr = f.filesize ? `${Math.round(f.filesize / 1024 / 1024)}MB`
         : f.filesize_approx ? `~${Math.round(f.filesize_approx / 1024 / 1024)}MB` : "";
 
-      // For needsMerge: give frontend a /download endpoint URL
-      // This is a GET URL the browser can directly use as <a href> download
-      const downloadUrl = needsMerge && SELF_URL
+      // For needsMerge: build a /download URL so browser fetches merged MP4 from our server
+      // For progressive: direct CDN URL works fine (already has audio)
+      const downloadUrl = needsMerge
         ? `${SELF_URL}/download?ytUrl=${encodeURIComponent(url)}&fv=${encodeURIComponent(f.format_id)}&fa=${encodeURIComponent(bestAudio.format_id)}&title=${encodeURIComponent(info.title ?? "video")}&secret=${encodeURIComponent(SECRET)}`
-        : f.url; // progressive: direct CDN url works fine
+        : f.url;
 
       return {
         url: downloadUrl,
@@ -154,12 +155,10 @@ app.post("/info", async (req, res) => {
         type: "video",
         formattedSize: sizeStr,
         needsMerge,
-        // Debug info
-        _debug: { formatId: f.format_id, audioFormatId: bestAudio?.format_id, isVideoOnly, hasSelfUrl: !!SELF_URL },
       };
     });
 
-    // Audio only options
+    // Audio options
     const audioFormats = formats
       .filter((f) => f.acodec && f.acodec !== "none" && (!f.vcodec || f.vcodec === "none") && f.url)
       .sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))
@@ -175,14 +174,12 @@ app.post("/info", async (req, res) => {
         type: "audio",
         formattedSize: sizeStr,
         needsMerge: false,
-        _debug: { formatId: af.format_id, isVideoOnly: false, hasSelfUrl: !!SELF_URL },
       });
     });
 
     if (medias.length === 0) return res.status(404).json({ error: "No formats found." });
 
-    console.log("[ytserver] SELF_URL:", SELF_URL || "(NOT SET — merge won't work!)");
-    console.log("[ytserver] formats:", medias.map((m) => `${m.quality}${m.needsMerge ? "[MERGE]" : ""}`).join(", "));
+    console.log("[ytserver] returning:", medias.map((m) => `${m.quality}${m.needsMerge ? "[MERGE]" : ""}`).join(", "));
 
     return res.json({
       title: info.title ?? "YouTube Video",
@@ -197,8 +194,8 @@ app.post("/info", async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// GET /download — yt-dlp merge → stream MP4
-// Params: ytUrl, fv (video formatId), fa (audio formatId), title, secret
+// GET /download — yt-dlp downloads & merges → streams MP4
+// Query: ytUrl, fv (video format_id), fa (audio format_id), title, secret
 // ══════════════════════════════════════════════
 app.get("/download", async (req, res) => {
   const { ytUrl, fv, fa, title, secret } = req.query;
@@ -223,6 +220,7 @@ app.get("/download", async (req, res) => {
       ? `--extractor-args "youtube:player_client=web,android"`
       : `--extractor-args "youtube:player_client=android"`;
 
+    // yt-dlp -f video+audio --merge-output-format mp4 handles the ffmpeg merge internally
     const cmd = [
       "yt-dlp",
       "--no-warnings",
@@ -236,13 +234,13 @@ app.get("/download", async (req, res) => {
       `"${safeUrl}"`,
     ].filter(Boolean).join(" ");
 
-    console.log(`[download] ${id} running: yt-dlp -f "${fv}+${fa}" ...`);
+    console.log(`[download] ${id} running yt-dlp merge...`);
     await execAsync(cmd, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 });
 
     if (!fs.existsSync(outFile)) throw new Error("Output file not created after yt-dlp");
 
     const stat = fs.statSync(outFile);
-    console.log(`[download] ${id} ✅ done — ${Math.round(stat.size / 1024 / 1024)}MB`);
+    console.log(`[download] ${id} ✅ ${Math.round(stat.size / 1024 / 1024)}MB`);
 
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Length", stat.size);
@@ -261,7 +259,7 @@ app.get("/download", async (req, res) => {
   } catch (e) {
     cleanup();
     console.error(`[download] ${id} FAILED:`, e.message.slice(0, 300));
-    if (!res.headersSent) res.status(500).send(`Merge failed: ${e.message.slice(0, 100)}`);
+    if (!res.headersSent) res.status(500).send(`Merge failed: ${e.message.slice(0, 200)}`);
   }
 });
 
