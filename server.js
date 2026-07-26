@@ -39,9 +39,33 @@ function cookieArgs() {
   return hasCookies ? `--cookies "${COOKIES_PATH}"` : "";
 }
 
+// Find yt-dlp binary — try multiple paths since pip install location varies
+async function findYtDlp() {
+  const candidates = [
+    "yt-dlp",
+    "/root/.local/bin/yt-dlp",
+    "/usr/local/bin/yt-dlp",
+    "/usr/bin/yt-dlp",
+    `${process.env.HOME || "/root"}/.local/bin/yt-dlp`,
+  ];
+  for (const bin of candidates) {
+    try {
+      await execAsync(`${bin} --version`, { timeout: 5000 });
+      console.log(`[ytserver] yt-dlp found at: ${bin}`);
+      return bin;
+    } catch {}
+  }
+  throw new Error("yt-dlp not found in any known location");
+}
+
+let YTDLP_BIN = "yt-dlp";
+findYtDlp().then(b => { YTDLP_BIN = b; }).catch(e => {
+  console.error("[ytserver] ❌ yt-dlp not found on startup:", e.message);
+});
+
 async function runYtDlpInfo(url, extra) {
   const safe = url.replace(/"/g, "").replace(/`/g, "").replace(/\$/g, "");
-  const cmd = `yt-dlp --dump-json --no-playlist --no-warnings --socket-timeout 15 ${extra} "${safe}"`;
+  const cmd = `${YTDLP_BIN} --dump-json --no-playlist --no-warnings --socket-timeout 15 ${extra} "${safe}"`;
   const { stdout } = await execAsync(cmd, { timeout: 55000, maxBuffer: 50 * 1024 * 1024 });
   return JSON.parse(stdout);
 }
@@ -222,7 +246,7 @@ app.get("/download", async (req, res) => {
 
     // yt-dlp -f video+audio --merge-output-format mp4 handles the ffmpeg merge internally
     const cmd = [
-      "yt-dlp",
+      YTDLP_BIN,
       "--no-warnings",
       "--no-playlist",
       `-f "${fv}+${fa}"`,
